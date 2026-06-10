@@ -41,6 +41,13 @@ WORKFLOW
   cd ~/projects/some-repo
   git-account use            # pick from numbered list → sets identity + rewrites remote
   git push                   # just works
+
+SHELL COMPLETION
+  # bash — add to ~/.bashrc
+  source <(git-account completion bash)
+
+  # zsh — add to ~/.zshrc
+  source <(git-account completion zsh)
 EOF
 }
 
@@ -466,6 +473,96 @@ cmd_remove() {
   ok "Account '$alias' removed."
 }
 
+cmd_completion() {
+  local shell="${1:-bash}"
+  local accounts_file="$HOME/.config/git-accounts/accounts"
+
+  case "$shell" in
+    bash) cat <<'EOF'
+# git-account bash completion
+_git_account_complete() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  local all_cmds="add list ls use show key token remove rm help completion"
+  local token_sub="set get clear"
+
+  # Detect offset: "git account ..." vs "git-account ..."
+  local offset=0
+  [[ "${COMP_WORDS[0]}" == "git" ]] && offset=1
+  local cmd="${COMP_WORDS[$((1 + offset))]:-}"
+
+  _ga_aliases() {
+    awk -F'\t' '{print $1}' "$HOME/.config/git-accounts/accounts" 2>/dev/null
+  }
+
+  # Completing the subcommand itself
+  if [[ $COMP_CWORD -eq $((1 + offset)) ]]; then
+    COMPREPLY=($(compgen -W "$all_cmds" -- "$cur"))
+    return
+  fi
+
+  case "$cmd" in
+    use|key|remove|rm)
+      COMPREPLY=($(compgen -W "$(_ga_aliases)" -- "$cur")) ;;
+    token)
+      if [[ $COMP_CWORD -eq $((2 + offset)) ]]; then
+        COMPREPLY=($(compgen -W "$token_sub" -- "$cur"))
+      else
+        COMPREPLY=($(compgen -W "$(_ga_aliases)" -- "$cur"))
+      fi ;;
+    completion)
+      COMPREPLY=($(compgen -W "bash zsh" -- "$cur")) ;;
+  esac
+}
+complete -F _git_account_complete git-account
+# Also fires for "git account ..."
+_git_account() { _git_account_complete; }
+EOF
+    ;;
+
+    zsh) cat <<'EOF'
+# git-account zsh completion
+_git_account() {
+  local -a cmds aliases token_sub
+
+  cmds=(
+    'add:Add a new account'
+    'list:List all configured accounts'
+    'use:Set account for current repo'
+    'show:Show identity and remotes'
+    'key:Print SSH public key'
+    'token:Manage PAT in keyring'
+    'remove:Remove an account'
+    'completion:Output shell completion script'
+  )
+  token_sub=('set:Store/update PAT' 'get:Print stored token' 'clear:Remove from keyring')
+  aliases=(${(f)"$(awk -F'\t' '{print $1}' "$HOME/.config/git-accounts/accounts" 2>/dev/null)"})
+
+  local state
+  _arguments \
+    '1: :->cmd' \
+    '2: :->arg1' \
+    '3: :->arg2' && return
+
+  case $state in
+    cmd)   _describe 'command' cmds ;;
+    arg1)
+      case "${words[2]}" in
+        use|key|remove|rm) _describe 'alias' aliases ;;
+        token)             _describe 'subcommand' token_sub ;;
+        completion)        compadd bash zsh ;;
+      esac ;;
+    arg2)
+      [[ "${words[2]}" == "token" ]] && _describe 'alias' aliases ;;
+  esac
+}
+compdef _git_account git-account
+EOF
+    ;;
+
+    *) die "Unknown shell '$shell'. Use: bash or zsh" ;;
+  esac
+}
+
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 main() {
@@ -478,6 +575,7 @@ main() {
     key)            cmd_key "$@"     ;;
     token)          cmd_token "$@"   ;;
     cred)           cmd_cred "$@"    ;;
+    completion)     cmd_completion "$@" ;;
     remove|rm)      cmd_remove "$@"  ;;
     help|-h|--help) usage            ;;
     *) die "Unknown command: $cmd\nRun: git-account help" ;;
