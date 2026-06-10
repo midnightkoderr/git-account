@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+# git-account — manage multiple git identities across GitHub, GitLab, Bitbucket
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/git-accounts"
+ACCOUNTS_FILE="$CONFIG_DIR/accounts"
+SSH_CONFIG="$HOME/.ssh/config"
+SSH_DIR="$HOME/.ssh"
+MARKER_START="# === git-account: managed ==="
+MARKER_END="# === git-account: end ==="
+
+# Accounts TSV — one account per line, fields (1-based):
+# 1=alias  2=provider  3=phost  4=ssh_alias  5=username  6=email  7=keypath  8=auth_mode
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+
+die()    { echo -e "${RED}error: $*${NC}" >&2; exit 1; }
+info()   { echo -e "${BLUE}$*${NC}"; }
+ok()     { echo -e "${GREEN}✓ $*${NC}"; }
+warn()   { echo -e "${YELLOW}warning: $*${NC}"; }
+header() { echo -e "\n${BOLD}$*${NC}"; }
+
+usage() {
+  cat <<'EOF'
+git-account — manage multiple git accounts (GitHub, GitLab, Bitbucket)
+
+COMMANDS
+  add                        Add a new account (interactive wizard)
+  list                       List all configured accounts
+  use [alias]                Set account for current repo — shows picker if no alias
+  show                       Show identity & remotes for current repo
+  key <alias>                Print SSH public key (SSH accounts only)
+  token set <alias>          Store / update a fine-grained PAT in the system keyring
+  token get <alias>          Print the stored token
+  token clear <alias>        Remove token from keyring
+  remove <alias>             Remove an account
+
+WORKFLOW
+  git-account add            # once per account
+  cd ~/projects/some-repo
+  git-account use            # pick from numbered list → sets identity + rewrites remote
+  git push                   # just works
+EOF
+}
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+init_dirs() {
+  mkdir -p "$CONFIG_DIR"
+  [[ -f "$ACCOUNTS_FILE" ]] || touch "$ACCOUNTS_FILE"
+  mkdir -p "$SSH_DIR"
+  chmod 700 "$SSH_DIR"
+}
+
+account_exists() { grep -q "^$1	" "$ACCOUNTS_FILE" 2>/dev/null; }
+account_field()  { awk -F'\t' -v a="$1" -v f="$2" '$1==a{print $f;exit}' "$ACCOUNTS_FILE"; }
+account_auth()   { local m; m=$(account_field "$1" 8); echo "${m:-ssh}"; }
+
+account_save() {
+  # args: alias provider phost ssh_alias username email keypath auth_mode
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$ACCOUNTS_FILE"
+}
+
+account_delete() {
+  local tmp; tmp=$(mktemp)
+  grep -v "^$1	" "$ACCOUNTS_FILE" > "$tmp" || true
+  mv "$tmp" "$ACCOUNTS_FILE"
+}
+
+check_secret_tool() {
+  command -v secret-tool &>/dev/null || \
+    die "secret-tool not found.\nInstall: sudo apt install libsecret-tools"
+}
+
+# ── SSH config ────────────────────────────────────────────────────────────────
+
+build_ssh_section() {
+  echo "$MARKER_START"
+  while IFS=$'\t' read -r _alias _prov phost ssh_alias _user _email keypath auth_mode; do
+    [[ "${auth_mode:-ssh}" == "ssh" ]] || continue
+    printf '\nHost %s\n  HostName %s\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\n' \
+      "$ssh_alias" "$phost" "$keypath"
+  done < "$ACCOUNTS_FILE"
+  printf '\n%s\n' "$MARKER_END"
+}
+
+update_ssh_config() {
+  touch "$SSH_CONFIG"
+  chmod 600 "$SSH_CONFIG"
+  local new_block tmp
+  new_block=$(build_ssh_section)
+  tmp=$(mktemp)
+  if grep -qF "$MARKER_START" "$SSH_CONFIG"; then
+    awk -v start="$MARKER_START" -v end="$MARKER_END" -v block="$new_block" '
+      $0 == start           { printf "%s\n", block; in_block=1; next }
+      in_block && $0 == end { in_block=0; next }
+      !in_block
+    ' "$SSH_CONFIG" > "$tmp"
+  else
+    { cat "$SSH_CONFIG"; printf '\n%s\n' "$new_block"; } > "$tmp"
+  fi
+  mv "$tmp" "$SSH_CONFIG"
+}
+
+# ── Provider helpers ──────────────────────────────────────────────────────────
+
+provider_hostname() {
+  case "$1" in
+    github)    echo "github.com" ;;
+    gitlab)    echo "gitlab.com" ;;
+    bitbucket) echo "bitbucket.org" ;;
+    *)         echo "" ;;
+  esac
+}
+
+provider_ssh_key_url() {
+  case "$1" in
+    github)    echo "https://github.com/settings/ssh/new" ;;
+    gitlab)    echo "https://gitlab.com/-/user_settings/ssh_keys" ;;
+    bitbucket) echo "https://bitbucket.org/account/settings/ssh-keys/" ;;
+    *)         echo "" ;;
+  esac
+}
+
+provider_token_url() {
+  case "$1" in
+    github)    echo "https://github.com/settings/tokens?type=beta" ;;
+    gitlab)    echo "https://gitlab.com/-/user_settings/personal_access_tokens" ;;
+    bitbucket) echo "https://bitbucket.org/account/settings/app-passwords/" ;;
+    *)         echo "" ;;
+  esac
+}
+
+# ── Remote URL rewrite ────────────────────────────────────────────────────────
+
+extract_path() {
+  local url="$1"
+  if [[ "$url" =~ ^https?:// ]]; then
+    printf '%s' "$url" | sed 's|https\?://[^/]*/||'
+  elif [[ "$url" =~ ^git@ ]]; then
+    printf '%s' "$url" | sed 's|git@[^:]*:||'
+  else
+    die "Cannot parse remote URL: $url"
+  fi
+}
+
+rewrite_to_ssh()   { echo "git@${2}:$(extract_path "$1")"; }
+rewrite_to_https() { echo "https://${2}/$(extract_path "$1")"; }
+
+# ── Numbered account picker ───────────────────────────────────────────────────
+
+# All display goes to stderr so the selected alias can be captured via $()
+pick_account() {
+  [[ -s "$ACCOUNTS_FILE" ]] || die "No accounts configured. Run: git-account add"
+
+  echo -e "\n${BOLD}Select account:${NC}" >&2
+  echo "" >&2
+  printf '  %-4s %-22s %-18s %-20s %s\n' "#" "ALIAS" "HOST" "USERNAME" "AUTH" >&2
+  printf '  %-4s %-22s %-18s %-20s %s\n' "--" "-----" "----" "--------" "----" >&2
+
+  local i=1
+  local -a aliases
+  while IFS=$'\t' read -r alias _prov phost _shost username _email _keypath auth_mode; do
+    printf '  %-4s %-22s %-18s %-20s %s\n' \
+      "$i)" "$alias" "$phost" "$username" "${auth_mode:-ssh}" >&2
+    aliases+=("$alias")
+    i=$((i + 1))
+  done < "$ACCOUNTS_FILE"
+
+  echo "" >&2
+  read -rp "Pick [1]: " choice >&2 || true
+  choice="${choice:-1}"
+  [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid choice."
+  local idx=$((choice - 1))
+  [[ $idx -lt 0 || $idx -ge ${#aliases[@]} ]] && die "Out of range."
+  echo "${aliases[$idx]}"
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_add() {
+  init_dirs
+  header "Add a new git account"
+  echo ""
+
+  read -rp "Alias (e.g. github-personal, gitlab-work): " alias
+  alias="${alias// /-}"
+  [[ -z "$alias" ]]       && die "Alias cannot be empty."
+  account_exists "$alias" && die "Account '$alias' already exists."
+
+  echo ""
+  echo "Provider:  1) GitHub   2) GitLab   3) Bitbucket   4) Other"
+  read -rp "Choice [1]: " pc
+  case "${pc:-1}" in
+    1) provider="github"    ;;
+    2) provider="gitlab"    ;;
+    3) provider="bitbucket" ;;
+    4) provider="other"     ;;
+    *) die "Invalid choice." ;;
+  esac
+
+  phost=$(provider_hostname "$provider")
+  if [[ -z "$phost" ]]; then
+    read -rp "Git hostname (e.g. git.mycompany.com): " phost
+    [[ -z "$phost" ]] && die "Hostname cannot be empty."
+  fi
+
+  echo ""
+  read -rp "Username on $phost: " username; [[ -z "$username" ]] && die "Required."
+  read -rp "Email:              " email;    [[ -z "$email"    ]] && die "Required."
+
+  echo ""
+  echo "Auth method:"
+  echo "  1) SSH key    — no expiry, no token rotation; add public key once to provider"
+  echo "  2) Token      — fine-grained PAT (scope per repo/permission); stored in keyring"
+  read -rp "Choice [1]: " ac
+  case "${ac:-1}" in
+    1) auth_mode="ssh"   ;;
+    2) auth_mode="token" ;;
+    *) die "Invalid choice." ;;
+  esac
+
+  if [[ "$auth_mode" == "ssh" ]]; then
+    local default_key="$SSH_DIR/id_${alias}"
+    echo ""
+    echo "SSH key:  1) Generate new key at $default_key"
+    echo "          2) Use existing key"
+    read -rp "Choice [1]: " kc
+    case "${kc:-1}" in
+      1)
+        if [[ -f "${default_key}.pub" ]]; then
+          warn "Key already exists — reusing."
+        else
+          info "Generating ed25519 key..."
+          ssh-keygen -t ed25519 -C "$email" -f "$default_key" -N "" -q
+          ok "Key generated."
+        fi
+        keypath="$default_key"
+        ;;
+      2)
+        read -rp "Path to private key: " keypath
+        keypath="${keypath/#\~/$HOME}"
+        [[ -f "$keypath" ]] || die "Key not found: $keypath"
+        ;;
+      *) die "Invalid choice." ;;
+    esac
+
+    account_save "$alias" "$provider" "$phost" "$alias" "$username" "$email" "$keypath" "ssh"
+    update_ssh_config
+    echo ""
+    ok "Account '$alias' added (SSH)."
+
+    local pubkey="${keypath}.pub"
+    if [[ -f "$pubkey" ]]; then
+      local keys_url; keys_url=$(provider_ssh_key_url "$provider")
+      echo ""
+      info "Add this public key to your $phost account:"
+      [[ -n "$keys_url" ]] && echo "  → $keys_url"
+      echo ""
+      cat "$pubkey"
+      echo ""
+      info "Then test: ssh -T git@$alias"
+    fi
+
+  else
+    check_secret_tool
+    account_save "$alias" "$provider" "$phost" "$alias" "$username" "$email" "-" "token"
+
+    local token_url; token_url=$(provider_token_url "$provider")
+    echo ""
+    info "Create a fine-grained PAT at your provider:"
+    [[ -n "$token_url" ]] && echo "  → $token_url"
+    echo ""
+    read -rsp "Paste your PAT (hidden, Enter to skip): " token; echo ""
+
+    if [[ -n "$token" ]]; then
+      printf '%s' "$token" | secret-tool store \
+        --label="git-account: $alias" \
+        service  git-account \
+        account  "$alias" \
+        username "$username"
+      ok "Token stored in keyring."
+    else
+      warn "No token stored — add it later with: git-account token set $alias"
+    fi
+
+    echo ""
+    ok "Account '$alias' added (token/HTTPS)."
+  fi
+}
+
+cmd_list() {
+  init_dirs
+  if [[ ! -s "$ACCOUNTS_FILE" ]]; then
+    info "No accounts yet. Run: git-account add"
+    return
+  fi
+  header "Configured accounts"
+  echo ""
+  printf '  %-22s %-18s %-20s %-8s %s\n' ALIAS HOST USERNAME AUTH KEY
+  printf '  %-22s %-18s %-20s %-8s %s\n' "-----" "----" "--------" "----" "---"
+  while IFS=$'\t' read -r alias _prov phost _shost username _email keypath auth_mode; do
+    local key_display
+    [[ "${auth_mode:-ssh}" == "token" ]] && key_display="(keyring)" || key_display="$keypath"
+    printf '  %-22s %-18s %-20s %-8s %s\n' "$alias" "$phost" "$username" "${auth_mode:-ssh}" "$key_display"
+  done < "$ACCOUNTS_FILE"
+}
+
+cmd_use() {
+  init_dirs
+  git rev-parse --is-inside-work-tree &>/dev/null || die "Not inside a git repository."
+
+  local alias="${1:-}"
+  [[ -z "$alias" ]] && alias=$(pick_account)
+  account_exists "$alias" || die "Unknown account '$alias'."
+
+  local auth_mode username email phost
+  auth_mode=$(account_auth "$alias")
+  username=$(account_field "$alias" 5)
+  email=$(account_field "$alias" 6)
+  phost=$(account_field "$alias" 3)
+
+  git config --local user.name  "$username"
+  git config --local user.email "$email"
+  ok "user.name  = $username"
+  ok "user.email = $email"
+
+  local remotes
+  remotes=$(git remote 2>/dev/null || true)
+  if [[ -z "$remotes" ]]; then
+    warn "No remotes configured."
+    return
+  fi
+
+  local script_path
+  script_path=$(command -v git-account 2>/dev/null || readlink -f "$0")
+
+  echo ""
+  while read -r remote; do
+    local old_url new_url
+    old_url=$(git remote get-url "$remote")
+
+    if [[ "$auth_mode" == "token" ]]; then
+      check_secret_tool
+      new_url=$(rewrite_to_https "$old_url" "$phost")
+      git remote set-url "$remote" "$new_url"
+      git config --local credential.helper "!$script_path cred $alias"
+      ok "remote '$remote'  →  $new_url  [token via keyring]"
+    else
+      new_url=$(rewrite_to_ssh "$old_url" "$alias")
+      git remote set-url "$remote" "$new_url"
+      ok "remote '$remote'  →  $new_url  [SSH]"
+    fi
+  done <<< "$remotes"
+
+  echo ""
+  ok "Account '$alias' is now active for this repo."
+}
+
+cmd_show() {
+  git rev-parse --is-inside-work-tree &>/dev/null || die "Not inside a git repository."
+  local name email
+  name=$(git config --local user.name  2>/dev/null || echo "(not set)")
+  email=$(git config --local user.email 2>/dev/null || echo "(not set)")
+  echo "  user.name  = $name"
+  echo "  user.email = $email"
+  local remotes; remotes=$(git remote 2>/dev/null || true)
+  if [[ -n "$remotes" ]]; then
+    echo ""
+    echo "  Remotes:"
+    while read -r r; do
+      echo "    $r → $(git remote get-url "$r")"
+    done <<< "$remotes"
+  fi
+  if [[ "$email" != "(not set)" ]] && [[ -s "$ACCOUNTS_FILE" ]]; then
+    local matched
+    matched=$(awk -F'\t' -v e="$email" '$6==e{print $1;exit}' "$ACCOUNTS_FILE" || true)
+    [[ -n "$matched" ]] && { echo ""; ok "Matched account: $matched"; }
+  fi
+}
+
+cmd_key() {
+  local alias="${1:-}"
+  [[ -z "$alias" ]] && die "Usage: git-account key <alias>"
+  init_dirs
+  account_exists "$alias" || die "Unknown account '$alias'."
+  [[ "$(account_auth "$alias")" == "token" ]] && die "'$alias' uses token auth — no SSH key."
+  local keypath pubkey provider keys_url
+  keypath=$(account_field "$alias" 7)
+  pubkey="${keypath}.pub"
+  [[ -f "$pubkey" ]] || die "Public key not found: $pubkey"
+  provider=$(account_field "$alias" 2)
+  keys_url=$(provider_ssh_key_url "$provider")
+  info "SSH public key for '$alias':"
+  [[ -n "$keys_url" ]] && echo "  → $keys_url"
+  echo ""
+  cat "$pubkey"
+}
+
+cmd_token() {
+  local subcmd="${1:-}" alias="${2:-}"
+  [[ -z "$subcmd" || -z "$alias" ]] && die "Usage: git-account token <set|get|clear> <alias>"
+  check_secret_tool
+  init_dirs
+  account_exists "$alias" || die "Unknown account '$alias'."
+
+  case "$subcmd" in
+    set)
+      local username; username=$(account_field "$alias" 5)
+      read -rsp "Paste PAT for '$alias' (hidden): " token; echo ""
+      [[ -z "$token" ]] && die "Token cannot be empty."
+      printf '%s' "$token" | secret-tool store \
+        --label="git-account: $alias" \
+        service  git-account \
+        account  "$alias" \
+        username "$username"
+      ok "Token stored for '$alias' (username: $username)."
+      ;;
+    get)
+      secret-tool lookup service git-account account "$alias" \
+        || die "No token stored for '$alias'."
+      ;;
+    clear)
+      secret-tool clear service git-account account "$alias" \
+        && ok "Token cleared for '$alias'." \
+        || warn "No token found for '$alias'."
+      ;;
+    *) die "Unknown subcommand '$subcmd'. Use: set|get|clear" ;;
+  esac
+}
+
+# Git credential helper — called internally by git for HTTPS token accounts.
+# Configured via: git config credential.helper "!git-account cred <alias>"
+cmd_cred() {
+  local alias="${1:-}" action="${2:-get}"
+  [[ -z "$alias" ]] && exit 1
+
+  case "$action" in
+    get)
+      while IFS= read -r line; do [[ -z "$line" ]] && break; done
+      local token username
+      token=$(secret-tool lookup service git-account account "$alias" 2>/dev/null) || exit 1
+      username=$(account_field "$alias" 5)
+      printf 'username=%s\npassword=%s\n' "$username" "$token"
+      ;;
+    store|erase)
+      while IFS= read -r line; do [[ -z "$line" ]] && break; done
+      ;;
+  esac
+}
+
+cmd_remove() {
+  local alias="${1:-}"
+  [[ -z "$alias" ]] && die "Usage: git-account remove <alias>"
+  init_dirs
+  account_exists "$alias" || die "Unknown account '$alias'."
+  read -rp "Remove '$alias'? SSH keys on disk are NOT deleted. [y/N]: " confirm
+  [[ "${confirm,,}" == "y" ]] || { echo "Aborted."; return; }
+  if [[ "$(account_auth "$alias")" == "token" ]]; then
+    check_secret_tool
+    secret-tool clear service git-account account "$alias" 2>/dev/null && ok "Token cleared from keyring." || true
+  fi
+  account_delete "$alias"
+  update_ssh_config
+  ok "Account '$alias' removed."
+}
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    add)            cmd_add          ;;
+    list|ls)        cmd_list         ;;
+    use)            cmd_use "$@"     ;;
+    show)           cmd_show         ;;
+    key)            cmd_key "$@"     ;;
+    token)          cmd_token "$@"   ;;
+    cred)           cmd_cred "$@"    ;;
+    remove|rm)      cmd_remove "$@"  ;;
+    help|-h|--help) usage            ;;
+    *) die "Unknown command: $cmd\nRun: git-account help" ;;
+  esac
+}
+
+main "$@"
