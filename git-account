@@ -63,7 +63,7 @@ init_dirs() {
   chmod 700 "$SSH_DIR"
 }
 
-account_exists() { grep -q "^$1	" "$ACCOUNTS_FILE" 2>/dev/null; }
+account_exists() { awk -F'\t' -v a="$1" 'BEGIN{s=1} $1==a{s=0;exit} END{exit s}' "$ACCOUNTS_FILE" 2>/dev/null; }
 account_field()  { awk -F'\t' -v a="$1" -v f="$2" '$1==a{print $f;exit}' "$ACCOUNTS_FILE"; }
 account_auth()   { local m; m=$(account_field "$1" 8); echo "${m:-ssh}"; }
 
@@ -74,7 +74,7 @@ account_save() {
 
 account_delete() {
   local tmp; tmp=$(mktemp)
-  grep -v "^$1	" "$ACCOUNTS_FILE" > "$tmp" || true
+  awk -F'\t' -v a="$1" '$1 != a' "$ACCOUNTS_FILE" > "$tmp" || true
   mv "$tmp" "$ACCOUNTS_FILE"
 }
 
@@ -197,6 +197,7 @@ cmd_add() {
   read -rp "Alias (e.g. github-personal, gitlab-work): " alias
   alias="${alias// /-}"
   [[ -z "$alias" ]]       && die "Alias cannot be empty."
+  [[ "$alias" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "Alias must contain only letters, numbers, hyphens, underscores, and dots."
   account_exists "$alias" && die "Account '$alias' already exists."
 
   echo ""
@@ -222,12 +223,12 @@ cmd_add() {
 
   echo ""
   echo "Auth method:"
-  echo "  1) SSH key    — no expiry, no token rotation; add public key once to provider"
-  echo "  2) Token      — fine-grained PAT (scope per repo/permission); stored in keyring"
+  echo "  1) Token      — fine-grained PAT (scope per repo/permission); stored in keyring"
+  echo "  2) SSH key    — no expiry, no token rotation; add public key once to provider"
   read -rp "Choice [1]: " ac
   case "${ac:-1}" in
-    1) auth_mode="ssh"   ;;
-    2) auth_mode="token" ;;
+    1) auth_mode="token" ;;
+    2) auth_mode="ssh"   ;;
     *) die "Invalid choice." ;;
   esac
 
@@ -337,11 +338,12 @@ cmd_use() {
   [[ -z "$alias" ]] && alias=$(pick_account)
   account_exists "$alias" || die "Unknown account '$alias'."
 
-  local auth_mode username email phost
+  local auth_mode username email phost keypath
   auth_mode=$(account_auth "$alias")
   username=$(account_field "$alias" 5)
   email=$(account_field "$alias" 6)
   phost=$(account_field "$alias" 3)
+  keypath=$(account_field "$alias" 7)
 
   local scope="--local"
   [[ "$global" == true ]] && scope="--global"
