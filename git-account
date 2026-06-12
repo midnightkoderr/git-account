@@ -28,7 +28,8 @@ git-account — manage multiple git accounts (GitHub, GitLab, Bitbucket)
 COMMANDS
   add                        Add a new account (interactive wizard)
   list                       List all configured accounts
-  use [alias]                Set account for current repo — shows picker if no alias
+  use [--global] [alias]     Set account for current repo — shows picker if no alias
+                             --global: set as global default (useful before cloning)
   show                       Show identity & remotes for current repo
   key <alias>                Print SSH public key (SSH accounts only)
   token set <alias>          Store / update a fine-grained PAT in the system keyring
@@ -38,8 +39,10 @@ COMMANDS
 
 WORKFLOW
   git-account add            # once per account
+  git-account use --global   # set a global default (for cloning new repos)
+  git clone git@...          # uses global identity
   cd ~/projects/some-repo
-  git-account use            # pick from numbered list → sets identity + rewrites remote
+  git-account use            # override locally → sets identity + rewrites remote
   git push                   # just works
 
 SHELL COMPLETION
@@ -316,7 +319,19 @@ cmd_list() {
 
 cmd_use() {
   init_dirs
-  git rev-parse --is-inside-work-tree &>/dev/null || die "Not inside a git repository."
+
+  # Parse --global flag
+  local global=false
+  local -a rest=()
+  for arg in "$@"; do
+    [[ "$arg" == "--global" ]] && global=true || rest+=("$arg")
+  done
+  set -- "${rest[@]+"${rest[@]}"}"
+
+  if [[ "$global" == false ]]; then
+    git rev-parse --is-inside-work-tree &>/dev/null || \
+      die "Not inside a git repository. Use --global to set a global default."
+  fi
 
   local alias="${1:-}"
   [[ -z "$alias" ]] && alias=$(pick_account)
@@ -328,10 +343,32 @@ cmd_use() {
   email=$(account_field "$alias" 6)
   phost=$(account_field "$alias" 3)
 
-  git config --local user.name  "$username"
-  git config --local user.email "$email"
+  local scope="--local"
+  [[ "$global" == true ]] && scope="--global"
+
+  git config "$scope" user.name  "$username"
+  git config "$scope" user.email "$email"
   ok "user.name  = $username"
   ok "user.email = $email"
+
+  local script_path
+  script_path=$(command -v git-account 2>/dev/null || readlink -f "$0")
+
+  if [[ "$global" == true ]]; then
+    if [[ "$auth_mode" == "token" ]]; then
+      check_secret_tool
+      git config --global --unset-all credential."https://$phost".helper 2>/dev/null || true
+      git config --global credential."https://$phost".helper ""
+      git config --global --add credential."https://$phost".helper "!$script_path cred $alias"
+      ok "credential.helper set globally for $phost  [token via keyring]"
+    else
+      git config --global core.sshCommand "ssh -i $keypath -o IdentitiesOnly=yes"
+      ok "core.sshCommand set globally  [SSH key: $keypath]"
+    fi
+    echo ""
+    ok "Account '$alias' is now the global default."
+    return
+  fi
 
   local remotes
   remotes=$(git remote 2>/dev/null || true)
@@ -339,9 +376,6 @@ cmd_use() {
     warn "No remotes configured."
     return
   fi
-
-  local script_path
-  script_path=$(command -v git-account 2>/dev/null || readlink -f "$0")
 
   echo ""
   while read -r remote; do
@@ -352,7 +386,12 @@ cmd_use() {
       check_secret_tool
       new_url=$(rewrite_to_https "$old_url" "$phost")
       git remote set-url "$remote" "$new_url"
-      git config --local credential.helper "!$script_path cred $alias"
+      # Clear inherited global helpers first, then set ours.
+      # Without the empty-string reset, git queries global helpers first and
+      # returns cached credentials from a different account before ours runs.
+      git config --local --unset-all credential.helper 2>/dev/null || true
+      git config --local credential.helper ""
+      git config --local --add credential.helper "!$script_path cred $alias"
       ok "remote '$remote'  →  $new_url  [token via keyring]"
     else
       new_url=$(rewrite_to_ssh "$old_url" "$alias")
@@ -501,7 +540,9 @@ _git_account_complete() {
   fi
 
   case "$cmd" in
-    use|key|remove|rm)
+    use)
+      COMPREPLY=($(compgen -W "--global $(_ga_aliases)" -- "$cur")) ;;
+    key|remove|rm)
       COMPREPLY=($(compgen -W "$(_ga_aliases)" -- "$cur")) ;;
     token)
       if [[ $COMP_CWORD -eq $((2 + offset)) ]]; then
@@ -547,7 +588,8 @@ _git_account() {
     cmd)   _describe 'command' cmds ;;
     arg1)
       case "${words[2]}" in
-        use|key|remove|rm) _describe 'alias' aliases ;;
+        use)               _describe 'option/alias' aliases; compadd -- --global ;;
+        key|remove|rm)     _describe 'alias' aliases ;;
         token)             _describe 'subcommand' token_sub ;;
         completion)        compadd bash zsh ;;
       esac ;;
