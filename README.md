@@ -60,13 +60,34 @@ Pick [1]:
 |---|---|
 | `git-account add` | Register a new account (interactive) |
 | `git-account list` | List all configured accounts |
-| `git-account use [alias]` | Set account for current repo — picker if no alias given |
+| `git-account use [--global] [alias]` | Set account for current repo — picker if no alias given; `--global` sets as the global default |
 | `git-account show` | Show identity + remotes for current repo |
 | `git-account key <alias>` | Print SSH public key (SSH accounts only) |
 | `git-account token set <alias>` | Store / update a PAT in the system keyring |
 | `git-account token get <alias>` | Print the stored token |
 | `git-account token clear <alias>` | Remove token from keyring |
 | `git-account remove <alias>` | Remove an account |
+
+## Global default
+
+`--global` sets `user.name` / `user.email` in `~/.gitconfig` and wires credentials globally — useful before cloning, or to set a default identity for new repos.
+
+```bash
+git-account use --global github-personal
+git clone git@github-personal:acme/api.git   # uses global identity automatically
+```
+
+**SSH accounts** — sets `core.sshCommand` globally so every repo using that key works without per-repo config:
+```
+core.sshCommand = ssh -i ~/.ssh/id_github-personal -o IdentitiesOnly=yes
+```
+
+**Token accounts** — registers a global credential helper scoped to the account's host:
+```
+credential.https://github.com.helper = !git-account cred github-work
+```
+
+Per-repo settings (from `git-account use` without `--global`) always take precedence over the global default.
 
 ## SSH mode
 
